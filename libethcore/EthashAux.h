@@ -32,17 +32,6 @@ namespace dev
 namespace eth
 {
 
-struct Solution
-{
-	uint64_t nonce;
-	h256 mixHash;
-	h256 headerHash;
-	h256 seedHash;
-	h256 boundary;
-	h256 job;
-	bool stale;
-};
-
 struct Result
 {
 	h256 value;
@@ -101,6 +90,15 @@ struct WorkPackage
 
 	uint64_t startNonce = 0;
 	int exSizeBits = -1;
+	int job_len = 8;
+};
+
+struct Solution
+{
+	uint64_t nonce;
+	h256 mixHash;
+	WorkPackage work;
+	bool stale;
 };
 
 }

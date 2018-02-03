@@ -262,7 +262,7 @@ CLMiner::CLMiner(FarmFace& _farm, unsigned _index):
 
 CLMiner::~CLMiner()
 {
-	pause();
+	kick_miner();
 }
 
 void CLMiner::report(uint64_t _nonce, WorkPackage const& _w)
@@ -271,23 +271,11 @@ void CLMiner::report(uint64_t _nonce, WorkPackage const& _w)
 	// TODO: Why re-evaluating?
 	Result r = EthashAux::eval(_w.seed, _w.header, _nonce);
 	if (r.value < _w.boundary)
-		farm.submitProof(Solution{_nonce, r.mixHash, _w.header, _w.seed, _w.boundary, _w.job, false});
+		farm.submitProof(Solution{_nonce, r.mixHash, _w, false});
 	else {
 		farm.failedSolution();
 		cwarn << "FAILURE: GPU gave incorrect result!";
 	}
-}
-
-void CLMiner::kickOff()
-{}
-
-namespace
-{
-uint64_t randomNonce()
-{
-	static std::mt19937_64 s_gen(std::random_device{}());
-	return std::uniform_int_distribution<uint64_t>{}(s_gen);
-}
 }
 
 void CLMiner::workLoop()
@@ -349,9 +337,8 @@ void CLMiner::workLoop()
 				if (w.exSizeBits >= 0)
 					startNonce = w.startNonce | ((uint64_t)index << (64 - 4 - w.exSizeBits)); // This can support up to 16 devices.
 				else
-					startNonce = randomNonce();
+					startNonce = get_start_nonce();
 
-				current = w;
 				auto switchEnd = std::chrono::high_resolution_clock::now();
 				auto globalSwitchTime = std::chrono::duration_cast<std::chrono::milliseconds>(switchEnd - workSwitchStart).count();
 				auto localSwitchTime = std::chrono::duration_cast<std::chrono::microseconds>(switchEnd - localSwitchStart).count();
@@ -367,13 +354,10 @@ void CLMiner::workLoop()
 			if (results[0] > 0)
 			{
 				// Ignore results except the first one.
-				nonce = startNonce + results[1];
+				nonce = current.startNonce + results[1];
 				// Reset search buffer if any solution found.
 				m_queue.enqueueWriteBuffer(m_searchBuffer, CL_FALSE, 0, sizeof(c_zero), &c_zero);
 			}
-
-			// Increase start nonce for following kernel execution.
-			startNonce += m_globalWorkSize;
 
 			// Run the kernel.
 			m_searchKernel.setArg(3, startNonce);
@@ -383,6 +367,11 @@ void CLMiner::workLoop()
 			// It takes some time because ethash must be re-evaluated on CPU.
 			if (nonce != 0)
 				report(nonce, current);
+
+			current = w;        // kernel now processing newest work
+			current.startNonce = startNonce;
+			// Increase start nonce for following kernel execution.
+			startNonce += m_globalWorkSize;
 
 			// Report hash count
 			addHashCount(m_globalWorkSize);
@@ -403,9 +392,7 @@ void CLMiner::workLoop()
 	}
 }
 
-void CLMiner::pause() {}
-
-void CLMiner::waitPaused() {}
+void CLMiner::kick_miner() {}
 
 unsigned CLMiner::getNumDevices()
 {
@@ -678,6 +665,18 @@ bool CLMiner::init(const h256& seed)
 			return false;
 		}
 
+		//check whether the current dag fits in memory everytime we recreate the DAG
+		cl_ulong result = 0;
+		device.getInfo(CL_DEVICE_GLOBAL_MEM_SIZE, &result);
+		if (result < dagSize)
+		{
+			cnote <<
+			"OpenCL device " << device.getInfo<CL_DEVICE_NAME>()
+							 << " has insufficient GPU memory." << result <<
+							 " bytes of memory found < " << dagSize << " bytes of memory required";	
+			return false;
+		}
+
 		// create buffer for dag
 		try
 		{
@@ -708,8 +707,6 @@ bool CLMiner::init(const h256& seed)
 		ETHCL_LOG("Creating mining buffer");
 		m_searchBuffer = cl::Buffer(m_context, CL_MEM_WRITE_ONLY, (c_maxSearchResults + 1) * sizeof(uint32_t));
 
-		cllog << "Generating DAG";
-
 		uint32_t const work = (uint32_t)(dagSize / sizeof(node));
 		uint32_t fullRuns = work / m_globalWorkSize;
 		uint32_t const restWork = work % m_globalWorkSize;
@@ -719,14 +716,18 @@ bool CLMiner::init(const h256& seed)
 		m_dagKernel.setArg(2, m_dag);
 		m_dagKernel.setArg(3, ~0u);
 
+		auto startDAG = std::chrono::steady_clock::now();
 		for (uint32_t i = 0; i < fullRuns; i++)
 		{
 			m_dagKernel.setArg(0, i * m_globalWorkSize);
 			m_queue.enqueueNDRangeKernel(m_dagKernel, cl::NullRange, m_globalWorkSize, m_workgroupSize);
 			m_queue.finish();
-			cllog << "DAG" << int(100.0f * i / fullRuns) << '%';
 		}
+		auto endDAG = std::chrono::steady_clock::now();
 
+		auto dagTime = std::chrono::duration_cast<std::chrono::milliseconds>(endDAG-startDAG);
+		float gb = (float)dagSize / (1024 * 1024 * 1024);
+		cnote << gb << " GB of DAG data generated in" << dagTime.count() << "ms.";
 	}
 	catch (cl::Error const& err)
 	{

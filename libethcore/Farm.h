@@ -51,6 +51,16 @@ public:
 		std::function<Miner*(FarmFace&, unsigned)> create;
 	};
 
+	Farm()
+	{
+		// Given that all nonces are equally likely to solve the problem
+		// we could reasonably always start the nonce search ranges
+		// at a fixed place, but that would be boring. Provide a once
+		// per run randomized start place, without creating much overhead.
+		random_device engine;
+		m_nonce_scrambler = uniform_int_distribution<uint64_t>()(engine);
+	}
+
 	~Farm()
 	{
 		stop();
@@ -72,8 +82,6 @@ public:
 		m_work = _wp;
 		for (auto const& m: m_miners)
 			m->setWork(m_work);
-		for (auto const& m: m_miners)
-			m->startWork();
 	}
 
 	void setSealers(std::map<std::string, SealerDescriptor> const& _sealers) { m_sealers = _sealers; }
@@ -152,39 +160,39 @@ public:
 		}
 	}
 
-	void collectHashRate()
-	{
-		WorkingProgress p;
-		Guard l2(x_minerWork);
-		p.ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_lastStart).count();
-		//Collect
-		for (auto const& i : m_miners)
-		{
-			uint64_t minerHashCount = i->hashCount();
-			p.hashes += minerHashCount;
-			p.minersHashes.push_back(minerHashCount);
-		}
+    void collectHashRate()
+    {
+        auto now = std::chrono::steady_clock::now();
 
-		//Reset
-		for (auto const& i : m_miners)
-		{
-			i->resetHashCount();
-		}
-		m_lastStart = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(x_minerWork);
 
-		if (p.hashes > 0) {
-			m_lastProgresses.push_back(p);
-		}
+        WorkingProgress p;
+        p.ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastStart).count();
+        m_lastStart = now;
 
-		// We smooth the hashrate over the last x seconds
-		int allMs = 0;
-		for (auto const& cp : m_lastProgresses) {
-			allMs += cp.ms;
-		}
-		if (allMs > m_hashrateSmoothInterval) {
-			m_lastProgresses.erase(m_lastProgresses.begin());
-		}
-	}
+        // Collect
+        for (auto const& i : m_miners)
+        {
+            uint64_t minerHashCount = i->hashCount();
+            p.hashes += minerHashCount;
+            p.minersHashes.push_back(minerHashCount);
+        }
+
+        // Reset
+        for (auto const& i : m_miners)
+            i->resetHashCount();
+
+        if (p.hashes > 0)
+            m_lastProgresses.push_back(p);
+
+        // We smooth the hashrate over the last x seconds
+        int allMs = 0;
+        for (auto const& cp : m_lastProgresses)
+            allMs += cp.ms;
+
+        if (allMs > m_hashrateSmoothInterval)
+            m_lastProgresses.erase(m_lastProgresses.begin());
+    }
 
 	void processHashRate(const boost::system::error_code& ec) {
 
@@ -215,43 +223,42 @@ public:
 		return m_isMining;
 	}
 
-	/**
-	 * @brief Get information on the progress of mining this work package.
-	 * @return The progress with mining so far.
-	 */
-	WorkingProgress const& miningProgress(bool hwmon = false) const
-	{
-		WorkingProgress p;
-		p.ms = 0;
-		p.hashes = 0;
-		{
-			Guard l2(x_minerWork);
-			for (auto const& i : m_miners) {
-				p.minersHashes.push_back(0);
-				if (hwmon)
-					p.minerMonitors.push_back(i->hwmon());
-			}
-		}
+    /**
+     * @brief Get information on the progress of mining this work package.
+     * @return The progress with mining so far.
+     */
+    WorkingProgress const& miningProgress(bool hwmon = false) const
+    {
+        std::lock_guard<std::mutex> lock(x_minerWork);
+        WorkingProgress p;
+        p.ms = 0;
+        p.hashes = 0;
+        for (auto const& i : m_miners)
+        {
+            p.minersHashes.push_back(0);
+            if (hwmon)
+                p.minerMonitors.push_back(i->hwmon());
+        }
 
-		for (auto const& cp : m_lastProgresses) {
-			p.ms += cp.ms;
-			p.hashes += cp.hashes;
-			for (unsigned int i = 0; i < cp.minersHashes.size(); i++)
-			{
-				p.minersHashes.at(i) += cp.minersHashes.at(i);
-			}
-		}
+        for (auto const& cp : m_lastProgresses)
+        {
+            p.ms += cp.ms;
+            p.hashes += cp.hashes;
+            for (unsigned int i = 0; i < cp.minersHashes.size(); i++)
+            {
+                p.minersHashes.at(i) += cp.minersHashes.at(i);
+            }
+        }
 
-		Guard l(x_progress);
-		m_progress = p;
-		return m_progress;
-	}
+        m_progress = p;
+        return m_progress;
+    }
 
 	SolutionStats getSolutionStats() {
 		return m_solutionStats;
 	}
 
-	void failedSolution() {
+	void failedSolution() override {
 		m_solutionStats.failed();
 	}
 
@@ -277,7 +284,7 @@ public:
 		}
 	}
 
-	using SolutionFound = std::function<bool(Solution const&)>;
+	using SolutionFound = std::function<void(Solution const&)>;
 	using MinerRestart = std::function<void()>;
 
 	/**
@@ -308,15 +315,20 @@ public:
 		return stream.str();
 	}
 
-    void set_pool_addresses(string primaryUrl, string primaryPort, string failoverUrl, string failoverPort) {
-        m_pool_addresses = primaryUrl + ":" + primaryPort;
-        if (failoverUrl != "")
-            m_pool_addresses += ";" + failoverUrl + ":" + failoverPort;
-    }
+	void set_pool_addresses(string primaryUrl, string primaryPort, string failoverUrl, string failoverPort) {
+		m_pool_addresses = primaryUrl + ":" + primaryPort;
+		if (failoverUrl != "")
+			m_pool_addresses += ";" + failoverUrl + ":" + failoverPort;
+	}
 
-    string get_pool_addresses() {
-        return m_pool_addresses;
-    }
+	string get_pool_addresses() {
+		return m_pool_addresses;
+	}
+
+	uint64_t get_nonce_scrambler() override
+	{
+		return m_nonce_scrambler;
+	}
 
 private:
 	/**
@@ -325,10 +337,10 @@ private:
 	 * @param _wp The WorkPackage that the Solution is for.
 	 * @return true iff the solution was good (implying that mining should be .
 	 */
-	bool submitProof(Solution const& _s) override
+	void submitProof(Solution const& _s) override
 	{
 		assert(m_onSolutionFound);
-		return m_onSolutionFound(_s);
+		m_onSolutionFound(_s);
 	}
 
 	mutable Mutex x_minerWork;
@@ -337,10 +349,7 @@ private:
 
 	std::atomic<bool> m_isMining = {false};
 
-	mutable Mutex x_progress;
 	mutable WorkingProgress m_progress;
-
-	mutable Mutex x_hwmons;
 
 	SolutionFound m_onSolutionFound;
 	MinerRestart m_onMinerRestart;
@@ -359,7 +368,8 @@ private:
 	mutable SolutionStats m_solutionStats;
 	std::chrono::steady_clock::time_point m_farm_launched = std::chrono::steady_clock::now();
 
-    string m_pool_addresses;
+    	string m_pool_addresses;
+	uint64_t m_nonce_scrambler;
 }; 
 
 }
