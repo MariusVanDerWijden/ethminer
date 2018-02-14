@@ -1,3 +1,5 @@
+#pragma once
+
 #include <iostream>
 #include <boost/array.hpp>
 #include <boost/asio.hpp>
@@ -25,7 +27,6 @@ public:
 	void setFailover(string const & host, string const & port);
 	void setFailover(string const & host, string const & port, string const & user, string const & pass);
 
-	bool isRunning() { return m_running; }
 	bool isConnected() { return m_connected.load(std::memory_order_relaxed) && m_authorized; }
 	h256 currentHeaderHash() { return m_current.header; }
 	bool current() { return static_cast<bool>(m_current); }
@@ -34,8 +35,8 @@ public:
 	void reconnect();
 private:
 	void connect();
-	
 	void disconnect();
+
 	void resolve_handler(const boost::system::error_code& ec, boost::asio::ip::tcp::resolver::iterator i);
 	void connect_handler(const boost::system::error_code& ec, boost::asio::ip::tcp::resolver::iterator i);
 	void work_timeout_handler(const boost::system::error_code& ec);
@@ -55,7 +56,6 @@ private:
 
 	bool m_authorized;
 	std::atomic<bool> m_connected = {false};
-	bool m_running = true;
 
 	int	m_retries = 0;
 	int	m_maxRetries;
@@ -77,6 +77,8 @@ private:
 	boost::asio::streambuf m_responseBuffer;
 
 	boost::asio::deadline_timer m_worktimer;
+
+	boost::asio::ip::tcp::resolver m_resolver;
 
 	int m_protocol;
 	string m_email;

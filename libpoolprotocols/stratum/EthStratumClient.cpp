@@ -29,7 +29,8 @@ static void diffToTarget(uint32_t *target, double diff)
 
 EthStratumClient::EthStratumClient(Farm* f, MinerType m, string const & host, string const & port, string const & user, string const & pass, int const & retries, int const & worktimeout, int const & protocol, string const & email)
         :       m_socket(m_io_service),
-	        m_worktimer(m_io_service)
+	        m_worktimer(m_io_service),
+	        m_resolver(m_io_service)
 {
 	m_minerType = m;
 	m_primary.host = host;
@@ -74,10 +75,9 @@ void EthStratumClient::setFailover(string const & host, string const & port, str
 
 void EthStratumClient::connect()
 {
-	tcp::resolver r(m_io_service);
 	tcp::resolver::query q(p_active->host, p_active->port);
 	
-	r.async_resolve(q, boost::bind(&EthStratumClient::resolve_handler,
+	m_resolver.async_resolve(q, boost::bind(&EthStratumClient::resolve_handler,
 					this, boost::asio::placeholders::error,
 					boost::asio::placeholders::iterator));
 
@@ -138,7 +138,6 @@ void EthStratumClient::disconnect()
 {
 	cnote << "Disconnecting";
 	m_connected.store(false, std::memory_order_relaxed);
-	m_running = false;
 	if (p_farm->isMining())
 	{
 		cnote << "Stopping farm";
@@ -529,16 +528,15 @@ void EthStratumClient::submit(Solution solution) {
 		boost::bind(&EthStratumClient::handleResponse, this,
 		boost::asio::placeholders::error));
 	m_submit_time = std::chrono::steady_clock::now();
+	unsigned n = (m_protocol == STRATUM_PROTOCOL_ETHEREUMSTRATUM) ? m_extraNonceHexSize : 0;
+	string sub_nonce = nonceHex.substr(n, 16 - n);
 	if (m_stale)
 	{
-		cwarn << EthYellow "Stale solution submitted to " + p_active->host + EthReset;
+		cwarn << string(EthYellow "Stale nonce 0x") + sub_nonce + " submitted to " + p_active->host + EthReset;
 	}
 	else
 	{
-		cnote << "Solution submitted to " + p_active->host;
-	}
-	if (m_protocol != STRATUM_PROTOCOL_ETHEREUMSTRATUM) {
-		cnote << "Nonce: 0x" + nonceHex;
+		cnote << string("Nonce 0x") +  sub_nonce + " submitted to " + p_active->host;
 	}
 }
 
