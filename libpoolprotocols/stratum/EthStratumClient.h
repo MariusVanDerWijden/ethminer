@@ -1,96 +1,162 @@
 #pragma once
 
 #include <iostream>
+
 #include <boost/array.hpp>
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <boost/bind.hpp>
-#include <json/json.h>
-#include <libdevcore/Log.h>
-#include <libdevcore/FixedHash.h>
-#include <libethcore/Farm.h>
-#include <libethcore/EthashAux.h>
-#include <libethcore/Miner.h>
-#include "BuildInfo.h"
+#include <boost/lockfree/queue.hpp>
 
+#include <json/json.h>
+
+#include <libdevcore/FixedHash.h>
+#include <libdevcore/Log.h>
+#include <libethcore/EthashAux.h>
+#include <libethcore/Farm.h>
+#include <libethcore/Miner.h>
+
+#include "../PoolClient.h"
 
 using namespace std;
 using namespace dev;
 using namespace dev::eth;
 
-
-class EthStratumClient
+template <typename Verifier>
+class verbose_verification
 {
 public:
-	EthStratumClient(Farm* f, MinerType m, string const & host, string const & port, string const & user, string const & pass, int const & retries, int const & worktimeout, int const & protocol, string const & email);
-	~EthStratumClient();
+    verbose_verification(Verifier verifier) : verifier_(verifier) {}
 
-	void setFailover(string const & host, string const & port);
-	void setFailover(string const & host, string const & port, string const & user, string const & pass);
+    bool operator()(bool preverified, boost::asio::ssl::verify_context& ctx)
+    {
+        char subject_name[256];
+        X509* cert = X509_STORE_CTX_get_current_cert(ctx.native_handle());
+        X509_NAME_oneline(X509_get_subject_name(cert), subject_name, 256);
+        bool verified = verifier_(preverified, ctx);
+#ifdef DEV_BUILD
+        cnote << "Certificate: " << subject_name << " " << (verified ? "Ok" : "Failed");
+#else
+        if (!verified)
+            cnote << "Certificate: " << subject_name << " "
+                  << "Failed";
+#endif
+        return verified;
+    }
 
-	bool isConnected() { return m_connected.load(std::memory_order_relaxed) && m_authorized; }
-	h256 currentHeaderHash() { return m_current.header; }
-	bool current() { return static_cast<bool>(m_current); }
-	bool submitHashrate(string const & rate);
-	void submit(Solution solution);
-	void reconnect();
 private:
-	void connect();
-	void disconnect();
+    Verifier verifier_;
+};
 
-	void resolve_handler(const boost::system::error_code& ec, boost::asio::ip::tcp::resolver::iterator i);
-	void connect_handler(const boost::system::error_code& ec, boost::asio::ip::tcp::resolver::iterator i);
-	void work_timeout_handler(const boost::system::error_code& ec);
+class EthStratumClient : public PoolClient
+{
+public:
+    enum StratumProtocol
+    {
+        STRATUM = 0,
+        ETHPROXY,
+        ETHEREUMSTRATUM,
+        ETHEREUMSTRATUM2
+    };
 
-	void readline();
-	void handleResponse(const boost::system::error_code& ec);
-	void readResponse(const boost::system::error_code& ec, std::size_t bytes_transferred);
-	void processReponse(Json::Value& responseObject);
-	
-	MinerType m_minerType;
+    EthStratumClient(int worktimeout, int responsetimeout);
 
-	cred_t * p_active;
-	cred_t m_primary;
-	cred_t m_failover;
+    void init_socket();
+    void connect() override;
+    void disconnect() override;
 
-	string m_worker; // eth-proxy only;
+    // Connected and Connection Statuses
+    bool isConnected() override
+    {
+        bool _ret = PoolClient::isConnected();
+        return _ret && !isPendingState();
+    }
+    bool isPendingState() override
+    {
+        return (m_connecting.load(std::memory_order_relaxed) ||
+                m_disconnecting.load(std::memory_order_relaxed));
+    }
 
-	bool m_authorized;
-	std::atomic<bool> m_connected = {false};
+    void submitHashrate(uint64_t const& rate, string const& id) override;
+    void submitSolution(const Solution& solution) override;
 
-	int	m_retries = 0;
-	int	m_maxRetries;
-	int m_worktimeout = 60;
+    h256 currentHeaderHash() { return m_current.header; }
+    bool current() { return static_cast<bool>(m_current); }
 
-	std::mutex x_pending;
-	int m_pending;
+private:
+    void startSession();
+    void disconnect_finalize();
+    void enqueue_response_plea();
+    std::chrono::milliseconds dequeue_response_plea();
+    void clear_response_pleas();
+    void resolve_handler(
+        const boost::system::error_code& ec, boost::asio::ip::tcp::resolver::iterator i);
+    void start_connect();
+    void connect_handler(const boost::system::error_code& ec);
+    void workloop_timer_elapsed(const boost::system::error_code& ec);
 
-	Farm* p_farm;
-	WorkPackage m_current;
+    void processResponse(Json::Value& responseObject);
+    std::string processError(Json::Value& erroresponseObject);
+    void processExtranonce(std::string& enonce);
 
-	bool m_stale = false;
+    void recvSocketData();
+    void onRecvSocketDataCompleted(
+        const boost::system::error_code& ec, std::size_t bytes_transferred);
+    void send(Json::Value const& jReq);
+    void sendSocketData();
+    void onSendSocketDataCompleted(const boost::system::error_code& ec);
+    void onSSLShutdownCompleted(const boost::system::error_code& ec);
 
-	std::thread m_serviceThread;  ///< The IO service thread.
-	boost::asio::io_service m_io_service;
-	boost::asio::ip::tcp::socket m_socket;
+    std::atomic<bool> m_disconnecting = {false};
+    std::atomic<bool> m_connecting = {false};
+    std::atomic<bool> m_authpending = {false};
 
-	boost::asio::streambuf m_requestBuffer;
-	boost::asio::streambuf m_responseBuffer;
+    // seconds to trigger a work_timeout (overwritten in constructor)
+    int m_worktimeout;
 
-	boost::asio::deadline_timer m_worktimer;
+    // seconds timeout for responses and connection (overwritten in constructor)
+    int m_responsetimeout;
 
-	boost::asio::ip::tcp::resolver m_resolver;
+    // default interval for workloop timer (milliseconds)
+    int m_workloop_interval = 1000;
 
-	int m_protocol;
-	string m_email;
+    WorkPackage m_current;
+    std::chrono::time_point<std::chrono::steady_clock> m_current_timestamp;
 
-	double m_nextWorkDifficulty;
+    boost::asio::io_service& m_io_service;  // The IO service reference passed in the constructor
+    boost::asio::io_service::strand m_io_strand;
+    boost::asio::ip::tcp::socket* m_socket;
+    std::string m_message;  // The internal message string buffer
+    bool m_newjobprocessed = false;
 
-	h64 m_extraNonce;
-	int m_extraNonceHexSize;
-	
-	string m_submit_hashrate_id;
+    // Use shared ptrs to avoid crashes due to async_writes
+    // see
+    // https://stackoverflow.com/questions/41526553/can-async-write-cause-segmentation-fault-when-this-is-deleted
+    std::shared_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>> m_securesocket;
+    std::shared_ptr<boost::asio::ip::tcp::socket> m_nonsecuresocket;
 
-	void processExtranonce(std::string& enonce);
+    boost::asio::streambuf m_sendBuffer;
+    boost::asio::streambuf m_recvBuffer;
+    Json::StreamWriterBuilder m_jSwBuilder;
 
-	std::chrono::steady_clock::time_point m_submit_time;
+    boost::asio::deadline_timer m_workloop_timer;
+
+    std::atomic<int> m_response_pleas_count = {0};
+    std::atomic<std::chrono::steady_clock::duration> m_response_plea_older;
+    boost::lockfree::queue<std::chrono::steady_clock::time_point> m_response_plea_times;
+
+    std::atomic<bool> m_txPending = {false};
+    boost::lockfree::queue<std::string*> m_txQueue;
+
+    boost::asio::ip::tcp::resolver m_resolver;
+    std::queue<boost::asio::ip::basic_endpoint<boost::asio::ip::tcp>> m_endpoints;
+
+    unsigned m_solution_submitted_max_id;  // maximum json id we used to send a solution
+
+    ///@brief Auxiliary function to make verbose_verification objects.
+    template <typename Verifier>
+    verbose_verification<Verifier> make_verbose_verification(Verifier verifier)
+    {
+        return verbose_verification<Verifier>(verifier);
+    }
 };

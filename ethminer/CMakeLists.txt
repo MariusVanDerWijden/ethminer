@@ -9,12 +9,14 @@ set(EXECUTABLE ethminer)
 file(GLOB HEADERS "*.h")
 
 add_executable(${EXECUTABLE} ${SRC_LIST} ${HEADERS})
+if(MSVC)
+	target_sources(${EXECUTABLE} PRIVATE ethminer.rc)
+endif()
 
-add_dependencies(${EXECUTABLE} BuildInfo.h)
+hunter_add_package(CLI11)
+find_package(CLI11 CONFIG REQUIRED)
 
-target_link_libraries(${EXECUTABLE} ethcore)
-target_link_libraries(${EXECUTABLE} ethash)
-target_link_libraries(${EXECUTABLE} poolprotocols devcore libjson-rpc-cpp::client)
+target_link_libraries(ethminer PRIVATE ethcore poolprotocols devcore ethminer-buildinfo CLI11::CLI11 Boost::system)
 
 if(ETHDBUS)
 	find_package(PkgConfig)
@@ -22,11 +24,11 @@ if(ETHDBUS)
 	pkg_check_modules(DBUS dbus-1)
 	include_directories(${DBUS_INCLUDE_DIRS})
 	link_directories(${DBUS_LIBRARY_DIRS})
-	target_link_libraries(${EXECUTABLE} ${DBUS_LIBRARIES})
+	target_link_libraries(ethminer PRIVATE ${DBUS_LIBRARIES})
 endif()
 
 if(APICORE)
-	target_link_libraries(${EXECUTABLE} apicore)
+	target_link_libraries(ethminer PRIVATE apicore)
 endif()
 
 include(GNUInstallDirs)
